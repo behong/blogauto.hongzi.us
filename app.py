@@ -54,6 +54,7 @@ from toss_open_api import (
     health as open_api_health,
     product_detail,
 )
+from telegram_approval import configured as telegram_approval_configured, start_polling
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -755,6 +756,8 @@ class AppHandler(BaseHTTPRequestHandler):
 def main() -> None:
     if automation_configured():
         init_automation_schema()
+    telegram_stop_event = threading.Event()
+    telegram_worker = start_polling(telegram_stop_event) if telegram_approval_configured() else None
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
     url = f"http://{HOST}:{PORT}"
     print("\n네이버 블로그 글 도우미를 시작했습니다.")
@@ -767,6 +770,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n종료합니다.")
     finally:
+        telegram_stop_event.set()
+        if telegram_worker:
+            telegram_worker.join(timeout=2)
         server.server_close()
 
 

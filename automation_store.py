@@ -189,6 +189,40 @@ CREATE TABLE IF NOT EXISTS admin_settings (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS toss_publisher_id text NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS publication_approval_batches (
+    id uuid PRIMARY KEY,
+    status text NOT NULL CHECK (status IN ('PENDING', 'APPROVED', 'HELD', 'EXPIRED')),
+    source text NOT NULL DEFAULT 'toss-daily',
+    item_count integer NOT NULL CHECK (item_count > 0),
+    summary jsonb NOT NULL DEFAULT '[]'::jsonb,
+    expected_chat_id text NOT NULL DEFAULT '',
+    telegram_message_id bigint,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    decided_at timestamptz,
+    decided_by_user_id text NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS publication_approval_batches_pending_idx
+    ON publication_approval_batches (status, expires_at ASC);
+
+CREATE TABLE IF NOT EXISTS publication_approval_events (
+    id bigserial PRIMARY KEY,
+    batch_id uuid NOT NULL REFERENCES publication_approval_batches(id) ON DELETE CASCADE,
+    action text NOT NULL CHECK (action IN ('APPROVED', 'HELD', 'EXPIRED', 'REJECTED')),
+    actor_user_id text NOT NULL DEFAULT '',
+    actor_chat_id text NOT NULL DEFAULT '',
+    recorded_at timestamptz NOT NULL DEFAULT now(),
+    detail text NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS publication_approval_events_batch_idx
+    ON publication_approval_events (batch_id, recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS telegram_bot_state (
+    state_key text PRIMARY KEY,
+    state_value text NOT NULL DEFAULT '',
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
 """
 
 
@@ -275,6 +309,164 @@ def set_admin_toss_publisher_id(publisher_id: str) -> None:
                 updated_at = now()
             """,
             (value,),
+        )
+
+
+APPROVAL_ACTIONS = {"APPROVED", "HELD"}
+
+
+def create_publication_approval_batch(
+    summary: list[dict[str, Any]],
+    expires_at: datetime,
+    source: str = "toss-daily",
+) -> dict[str, Any]:
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID is not configured")
+    if not summary:
+        raise ValueError("approval batch requires at least one item")
+    if len(summary) > 10:
+        raise ValueError("approval batch cannot contain more than 10 items")
+    if expires_at.tzinfo is None:
+        raise ValueError("approval expiry must include a timezone")
+    batch_id = uuid.uuid4()
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO publication_approval_batches
+                (id, status, source, item_count, summary, expected_chat_id, expires_at)
+            VALUES (%s, 'PENDING', %s, %s, %s::jsonb, %s, %s)
+            RETURNING id, status, source, item_count, summary, created_at, expires_at
+            """,
+            (
+                batch_id,
+                str(source or "toss-daily")[:100],
+                len(summary),
+                json.dumps(summary, ensure_ascii=False),
+                TELEGRAM_CHAT_ID,
+                expires_at,
+            ),
+        ).fetchone()
+    return dict(row or {})
+
+
+def set_publication_approval_expected_chat_id(batch_id: str, chat_id: str) -> None:
+    parsed_id = uuid.UUID(str(batch_id))
+    normalized_chat_id = str(chat_id or "").strip()
+    if not normalized_chat_id:
+        raise ValueError("invalid Telegram chat ID")
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE publication_approval_batches SET expected_chat_id = %s WHERE id = %s",
+            (normalized_chat_id[:100], parsed_id),
+        )
+
+
+def set_publication_approval_message_id(batch_id: str, message_id: int) -> None:
+    parsed_id = uuid.UUID(str(batch_id))
+    parsed_message_id = int(message_id)
+    if parsed_message_id <= 0:
+        raise ValueError("invalid Telegram message ID")
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE publication_approval_batches SET telegram_message_id = %s WHERE id = %s",
+            (parsed_message_id, parsed_id),
+        )
+
+
+def resolve_publication_approval(
+    batch_id: str,
+    action: str,
+    actor_chat_id: str,
+    actor_user_id: str,
+) -> dict[str, Any]:
+    parsed_id = uuid.UUID(str(batch_id))
+    normalized_action = str(action or "").strip().upper()
+    if normalized_action not in APPROVAL_ACTIONS:
+        raise ValueError("unsupported approval action")
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM publication_approval_batches WHERE id = %s FOR UPDATE",
+            (parsed_id,),
+        ).fetchone()
+        if not row:
+            return {"accepted": False, "reason": "not_found"}
+        batch = dict(row)
+        if str(batch.get("expected_chat_id") or "") != str(actor_chat_id or ""):
+            conn.execute(
+                """
+                INSERT INTO publication_approval_events
+                    (batch_id, action, actor_user_id, actor_chat_id, detail)
+                VALUES (%s, 'REJECTED', %s, %s, 'unexpected_chat')
+                """,
+                (parsed_id, str(actor_user_id or "")[:100], str(actor_chat_id or "")[:100]),
+            )
+            return {"accepted": False, "reason": "unexpected_chat"}
+        if batch.get("status") != "PENDING":
+            return {"accepted": False, "reason": str(batch.get("status") or "resolved").lower()}
+        now = datetime.now(timezone.utc)
+        if batch.get("expires_at") is not None and batch["expires_at"] <= now:
+            conn.execute(
+                """
+                UPDATE publication_approval_batches
+                SET status = 'EXPIRED', decided_at = now(), decided_by_user_id = %s
+                WHERE id = %s
+                """,
+                (str(actor_user_id or "")[:100], parsed_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO publication_approval_events
+                    (batch_id, action, actor_user_id, actor_chat_id, detail)
+                VALUES (%s, 'EXPIRED', %s, %s, 'expired_before_response')
+                """,
+                (parsed_id, str(actor_user_id or "")[:100], str(actor_chat_id or "")[:100]),
+            )
+            return {"accepted": False, "reason": "expired"}
+        updated = conn.execute(
+            """
+            UPDATE publication_approval_batches
+            SET status = %s, decided_at = now(), decided_by_user_id = %s
+            WHERE id = %s AND status = 'PENDING'
+            RETURNING id, status, item_count, summary, telegram_message_id, expires_at
+            """,
+            (normalized_action, str(actor_user_id or "")[:100], parsed_id),
+        ).fetchone()
+        if not updated:
+            return {"accepted": False, "reason": "resolved"}
+        conn.execute(
+            """
+            INSERT INTO publication_approval_events
+                (batch_id, action, actor_user_id, actor_chat_id, detail)
+            VALUES (%s, %s, %s, %s, 'telegram_callback')
+            """,
+            (parsed_id, normalized_action, str(actor_user_id or "")[:100], str(actor_chat_id or "")[:100]),
+        )
+    result = dict(updated or {})
+    result["accepted"] = True
+    return result
+
+
+def telegram_update_offset() -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT state_value FROM telegram_bot_state WHERE state_key = 'update_offset'"
+        ).fetchone()
+    try:
+        return max(0, int((row or {}).get("state_value") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_telegram_update_offset(offset: int) -> None:
+    value = max(0, int(offset))
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_bot_state (state_key, state_value)
+            VALUES ('update_offset', %s)
+            ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = now()
+            """,
+            (str(value),),
         )
 
 
