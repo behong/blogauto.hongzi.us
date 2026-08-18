@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+OPEN_API_ENV = os.getenv("TOSS_OPEN_API_ENV", "production").strip().lower()
+OPEN_API_BASE_URL = os.getenv(
+    "TOSS_OPEN_API_BASE_URL",
+    "https://alpha-sharelink.toss.im/openapi"
+    if OPEN_API_ENV in {"alpha", "test", "testing"}
+    else "https://sharelink.toss.im/openapi",
+).rstrip("/")
+OPEN_API_TOKEN_URL = os.getenv(
+    "TOSS_OPEN_API_TOKEN_URL",
+    "https://oauth2-alpha.cert.toss.im/token"
+    if OPEN_API_ENV in {"alpha", "test", "testing"}
+    else "https://oauth2.cert.toss.im/token",
+)
+OPEN_API_ACCESS_KEY = os.getenv("TOSS_OPEN_API_ACCESS_KEY", "").strip()
+OPEN_API_SECRET_KEY = os.getenv("TOSS_OPEN_API_SECRET_KEY", "").strip()
+OPEN_API_TOKEN_STORE_FILE = os.getenv("TOSS_OPEN_API_TOKEN_STORE_FILE", "").strip()
+OPEN_API_REFRESH_MARGIN_SECONDS = int(
+    os.getenv("TOSS_OPEN_API_TOKEN_REFRESH_MARGIN_SECONDS", "300")
+)
+OPEN_API_TIMEOUT_SECONDS = int(os.getenv("TOSS_OPEN_API_TIMEOUT_SECONDS", "30"))
+OPEN_API_MAX_RETRIES = int(os.getenv("TOSS_OPEN_API_MAX_RETRIES", "3"))
+TOKEN_SCOPE = "sharelink:read sharelink:write"
+MAX_RESPONSE_BYTES = 3 * 1024 * 1024
+
+_token_lock = threading.RLock()
+_memory_token: dict[str, Any] = {}
+
+
+class TossOpenApiError(RuntimeError):
+    def __init__(self, message: str, *, status: int | None = None, code: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def configured() -> bool:
+    return bool(OPEN_API_ACCESS_KEY and OPEN_API_SECRET_KEY)
+
+
+def health() -> dict[str, object]:
+    result: dict[str, object] = {
+        "status": "error",
+        "environment": OPEN_API_ENV,
+        "configured": configured(),
+    }
+    if OPEN_API_ENV != "production":
+        result["error"] = "production environment is required"
+        return result
+    if not configured():
+        result["error"] = "credentials are not configured"
+        return result
+    try:
+        get_access_token()
+    except TossOpenApiError as exc:
+        result["error"] = str(exc)
+        return result
+    result["status"] = "ok"
+    return result
+
+
+def _credential_hash() -> str:
+    return hashlib.sha256(OPEN_API_ACCESS_KEY.encode("utf-8")).hexdigest()[:16]
+
+
+def _token_store_path() -> Path | None:
+    return Path(OPEN_API_TOKEN_STORE_FILE) if OPEN_API_TOKEN_STORE_FILE else None
+
+
+def _usable_token(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("environment") != OPEN_API_ENV:
+        return ""
+    if payload.get("credentialKeyHash") != _credential_hash():
+        return ""
+    if payload.get("scope") != TOKEN_SCOPE:
+        return ""
+    token = str(payload.get("accessToken") or "").strip()
+    try:
+        expires_at = float(payload.get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if token and expires_at > time.time() + max(OPEN_API_REFRESH_MARGIN_SECONDS, 0):
+        return token
+    return ""
+
+
+def _load_cached_token() -> str:
+    token = _usable_token(_memory_token)
+    if token:
+        return token
+    path = _token_store_path()
+    if path is None:
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return ""
+    token = _usable_token(payload)
+    if token and isinstance(payload, dict):
+        _memory_token.clear()
+        _memory_token.update(payload)
+    return token
+
+
+def _save_cached_token(token: str, expires_in: int) -> None:
+    payload = {
+        "accessToken": token,
+        "expiresAt": time.time() + max(expires_in, 1),
+        "environment": OPEN_API_ENV,
+        "credentialKeyHash": _credential_hash(),
+        "scope": TOKEN_SCOPE,
+    }
+    _memory_token.clear()
+    _memory_token.update(payload)
+    path = _token_store_path()
+    if path is None:
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+    except OSError:
+        # The in-memory cache remains usable when a read-only filesystem blocks persistence.
+        pass
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _json_body(response: Any) -> dict[str, Any]:
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise TossOpenApiError("토스 Open API 응답이 너무 큽니다.")
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TossOpenApiError("토스 Open API 응답 형식을 읽을 수 없습니다.") from exc
+    if not isinstance(payload, dict):
+        raise TossOpenApiError("토스 Open API 응답 형식이 올바르지 않습니다.")
+    return payload
+
+
+def _issue_access_token() -> str:
+    if not configured():
+        raise TossOpenApiError("토스 Open API 인증정보가 설정되지 않았습니다.")
+    request = urllib.request.Request(
+        OPEN_API_TOKEN_URL,
+        data=urllib.parse.urlencode(
+            {
+                "grant_type": "client_credentials",
+                "client_id": OPEN_API_ACCESS_KEY,
+                "client_secret": OPEN_API_SECRET_KEY,
+                "scope": TOKEN_SCOPE,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(OPEN_API_TIMEOUT_SECONDS, 1)) as response:
+            payload = _json_body(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = _json_body(exc)
+            reason = str(payload.get("error_description") or payload.get("error") or "")
+        except TossOpenApiError:
+            reason = ""
+        raise TossOpenApiError(reason or "토스 Open API 인증에 실패했습니다.", status=exc.code) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise TossOpenApiError("토스 Open API 인증 서버에 연결하지 못했습니다.") from exc
+
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise TossOpenApiError("토스 Open API 토큰이 응답에 없습니다.")
+    try:
+        expires_in = int(payload.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        expires_in = 1
+    _save_cached_token(token, expires_in)
+    return token
+
+
+def get_access_token(force_refresh: bool = False) -> str:
+    with _token_lock:
+        if not force_refresh:
+            token = _load_cached_token()
+            if token:
+                return token
+        return _issue_access_token()
+
+
+def _api_error(payload: object, status: int) -> TossOpenApiError:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    error = error if isinstance(error, dict) else {}
+    code = str(error.get("errorCode") or "").strip()
+    reason = str(error.get("reason") or "").strip()
+    try:
+        error_status = int(error.get("errorType") or status)
+    except (TypeError, ValueError):
+        error_status = status
+    return TossOpenApiError(
+        reason or code or f"토스 Open API 요청에 실패했습니다. ({status})",
+        status=error_status,
+        code=code,
+    )
+
+
+def _retry_delay(headers: Any, attempt: int) -> float:
+    retry_after = str(headers.get("Retry-After") or "").strip() if headers else ""
+    try:
+        return max(0.0, min(float(retry_after), 30.0)) if retry_after else float(2**attempt)
+    except ValueError:
+        return float(2**attempt)
+
+
+def api_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, object] | None = None,
+    json_body: dict[str, object] | None = None,
+) -> object:
+    max_attempts = max(OPEN_API_MAX_RETRIES, 1)
+    refreshed = False
+    token = get_access_token()
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
+        query = urllib.parse.urlencode(params or {})
+        url = f"{OPEN_API_BASE_URL}/{path.lstrip('/')}"
+        if query:
+            url = f"{url}?{query}"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        data = None
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(json_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers=headers,
+            method=method.upper(),
+        )
+        status = 0
+        headers: Any = None
+        try:
+            with urllib.request.urlopen(request, timeout=max(OPEN_API_TIMEOUT_SECONDS, 1)) as response:
+                status = response.status
+                headers = response.headers
+                payload = _json_body(response)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            headers = exc.headers
+            try:
+                payload = _json_body(exc)
+            except TossOpenApiError:
+                payload = {}
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < max_attempts:
+                time.sleep(float(min(2 ** (attempt - 1), 30)))
+                continue
+            raise TossOpenApiError("토스 Open API 서버에 연결하지 못했습니다.") from exc
+
+        if 200 <= status < 300 and payload.get("resultType") == "SUCCESS":
+            return payload.get("success")
+        error = _api_error(payload, status)
+        if (error.status == 401 or error.code == "UNAUTHORIZED") and not refreshed:
+            refreshed = True
+            token = get_access_token(force_refresh=True)
+            max_attempts = max(max_attempts, attempt + 1)
+            continue
+        retryable = error.status in {429, 500} or error.code in {"TOO_MANY_REQUEST", "INTERNAL_ERROR"}
+        if retryable and attempt < max_attempts:
+            time.sleep(_retry_delay(headers, attempt - 1))
+            continue
+        raise error
+    raise TossOpenApiError("토스 Open API 요청에 실패했습니다.")
+
+
+def normalize_product(item: dict[str, object]) -> dict[str, object]:
+    main_images = item.get("mainImageUrls")
+    images = [str(url) for url in main_images if url] if isinstance(main_images, list) else []
+    thumbnail = str(item.get("thumbnailUrl") or "").strip()
+    if not images and thumbnail:
+        images.append(thumbnail)
+    price = "".join(character for character in str(item.get("displayPrice") or "") if character.isdigit())
+    return {
+        "taca_item_id": str(item.get("tacaItemId") or ""),
+        "title": str(item.get("displayName") or "").strip(),
+        "price": price,
+        "images": images,
+        "is_sold_out": bool(item.get("isSoldOut")),
+    }
+
+
+def product_detail(taca_item_id: str = "", taca_id: str = "") -> dict[str, object]:
+    if not taca_item_id and not taca_id:
+        raise TossOpenApiError("토스 상품 ID를 찾지 못했습니다.")
+    params = {"tacaItemIds": taca_item_id} if taca_item_id else {"tacaIds": taca_id}
+    payload = api_request("GET", "/products/detail", params=params)
+    if not isinstance(payload, dict):
+        raise TossOpenApiError("토스 상품 상세 응답 형식이 올바르지 않습니다.")
+    items = [item for item in payload.get("items", []) if isinstance(item, dict)]
+    selected = next(
+        (item for item in items if str(item.get("tacaItemId") or "") == taca_item_id),
+        items[0] if items else None,
+    )
+    if selected is None:
+        raise TossOpenApiError("토스 Open API에서 상품 상세 정보를 찾지 못했습니다.")
+    return normalize_product(selected)
+
+
+def issue_share_link(taca_item_id: str, publisher_id: str) -> dict[str, str]:
+    """Issue one documented tracked link for a selected Toss item option."""
+    item_id = str(taca_item_id or "").strip()
+    publisher = str(publisher_id or "").strip()
+    if not item_id.isdigit():
+        raise TossOpenApiError("토스 상품 옵션 ID가 올바르지 않습니다.")
+    try:
+        uuid.UUID(publisher)
+    except (AttributeError, ValueError) as exc:
+        raise TossOpenApiError("토스 퍼블리셔 UUID가 설정되지 않았습니다.") from exc
+    payload = api_request(
+        "POST",
+        "/links",
+        json_body={"tacaItemId": int(item_id), "publisherId": publisher},
+    )
+    if not isinstance(payload, dict):
+        raise TossOpenApiError("토스 쉐어링크 발급 응답 형식이 올바르지 않습니다.")
+    short_url = str(payload.get("shortUrl") or "").strip()
+    origin_url = str(payload.get("originUrl") or "").strip()
+    actual_item_id = str(payload.get("tacaItemId") or item_id).strip()
+    actual_publisher_id = str(payload.get("publisherId") or publisher).strip()
+    if not short_url.startswith("https://"):
+        raise TossOpenApiError("토스 쉐어링크 발급 응답에 단축 URL이 없습니다.")
+    return {
+        "taca_item_id": actual_item_id,
+        "publisher_id": actual_publisher_id,
+        "short_url": short_url,
+        "origin_url": origin_url,
+    }
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_product_card(item: dict[str, object]) -> dict[str, object]:
+    """Normalize a list-response card without discarding forward-compatible fields."""
+    return {
+        "taca_item_id": str(item.get("tacaItemId") or ""),
+        "title": str(item.get("displayName") or "").strip(),
+        "thumbnail_url": str(item.get("thumbnailUrl") or "").strip(),
+        "product_url": str(item.get("productUrl") or "").strip(),
+        "display_price": _as_optional_int(item.get("displayPrice")),
+        "original_price": _as_optional_int(item.get("originalPrice")),
+        "discount_rate": _as_optional_int(item.get("discountRate")),
+        "is_sold_out": bool(item.get("isSoldOut")),
+        "review_score": item.get("reviewScore"),
+        "review_count": _as_optional_int(item.get("reviewCount")),
+        "rank": _as_optional_int(item.get("rank")),
+        "end_at": str(item.get("endAt") or "").strip(),
+    }
+
+
+def product_listing(
+    path: str,
+    *,
+    size: int,
+    maximum_size: int,
+    cursor: str = "",
+) -> dict[str, object]:
+    """Fetch one cursor page from a documented Toss Sharelink product listing endpoint."""
+    bounded_size = min(max(int(size), 1), maximum_size)
+    params: dict[str, object] = {"size": bounded_size}
+    if cursor.strip():
+        params["cursor"] = cursor.strip()
+    payload = api_request("GET", path, params=params)
+    if not isinstance(payload, dict):
+        raise TossOpenApiError("토스 Open API 상품 목록 응답 형식이 올바르지 않습니다.")
+    raw_items = payload.get("items", [])
+    if not isinstance(raw_items, list):
+        raise TossOpenApiError("토스 Open API 상품 목록 항목 형식이 올바르지 않습니다.")
+    items = [normalize_product_card(item) for item in raw_items if isinstance(item, dict)]
+    return {
+        "items": items,
+        "next_cursor": str(payload.get("nextCursor") or ""),
+        "has_next": bool(payload.get("hasNext")),
+    }
+
+
+def best_selling_products(size: int = 30, cursor: str = "") -> dict[str, object]:
+    """Fetch the current overall best-selling product page (1–100 items)."""
+    return product_listing(
+        "/products/best-selling", size=size, maximum_size=100, cursor=cursor
+    )
+
+
+def today_deal_products(size: int = 30, cursor: str = "") -> dict[str, object]:
+    """Fetch the current today-deals product page (1–30 items)."""
+    return product_listing(
+        "/products/today-deals", size=size, maximum_size=30, cursor=cursor
+    )
