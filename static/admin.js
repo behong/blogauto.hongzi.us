@@ -219,7 +219,21 @@
         method: "POST",
         body: JSON.stringify({ source: source.value, size: currentSize() }),
       });
-      setStatus(collectionStatus, `${result.saved_count || 0}건을 저장했습니다. 수집 목록을 새로고침합니다.`, "success");
+      const auto = result.auto_issuance || {};
+      const autoSummary = auto.enabled
+        ? ` 신규 발급 ${Number(auto.issued) || 0}건, 기존 링크 재사용 ${Number(auto.reused) || 0}건입니다.`
+        : " 자동 링크 발급은 현재 꺼져 있습니다.";
+      const skipped = (Number(auto.skipped_sold_out) || 0) + (Number(auto.skipped_invalid) || 0);
+      const suffix = [
+        skipped ? `품절·유효하지 않은 항목 ${skipped}건은 제외했습니다.` : "",
+        auto.quota_exceeded ? "일일 새 링크 발급 한도에 도달해 남은 항목은 건너뛰었습니다." : "",
+        Number(auto.failed) ? `발급 실패 ${Number(auto.failed)}건이 있습니다.` : "",
+      ].filter(Boolean).join(" ");
+      setStatus(
+        collectionStatus,
+        `${result.saved_count || 0}건을 저장했습니다.${autoSummary}${suffix ? ` ${suffix}` : ""} 수집 목록을 새로고침합니다.`,
+        Number(auto.failed) || auto.quota_exceeded ? "error" : "success",
+      );
       await load(true);
     } catch (error) {
       if (!dashboard.hidden) setStatus(collectionStatus, error.message || "토스 수집 중 오류가 발생했습니다.", "error");
