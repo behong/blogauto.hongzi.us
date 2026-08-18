@@ -12,11 +12,12 @@ from typing import Any
 
 from automation_store import (
     TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
+    active_telegram_approval_chat_id,
     create_publication_approval_batch,
     resolve_publication_approval,
     set_publication_approval_expected_chat_id,
     set_publication_approval_message_id,
+    set_telegram_approval_chat_candidate,
     set_telegram_update_offset,
     telegram_update_offset,
 )
@@ -28,7 +29,7 @@ POLL_TIMEOUT_SECONDS = 25
 
 
 def configured() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    return bool(TELEGRAM_BOT_TOKEN and active_telegram_approval_chat_id())
 
 
 def _api(method: str, payload: dict[str, Any] | None = None, timeout: int = 15) -> Any:
@@ -87,7 +88,7 @@ def send_publication_approval(summary: list[dict[str, Any]], source: str = "toss
     result = _api(
         "sendMessage",
         {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": active_telegram_approval_chat_id(),
             "text": "\n".join(lines),
             "reply_markup": json.dumps(keyboard, ensure_ascii=False, separators=(",", ":")),
             "disable_web_page_preview": "true",
@@ -126,6 +127,13 @@ def _disable_buttons(chat_id: str, message_id: int) -> None:
 
 
 def handle_update(update: dict[str, Any]) -> None:
+    membership = update.get("my_chat_member")
+    if isinstance(membership, dict):
+        chat = membership.get("chat") if isinstance(membership.get("chat"), dict) else {}
+        status = membership.get("new_chat_member") if isinstance(membership.get("new_chat_member"), dict) else {}
+        if str(status.get("status") or "") in {"member", "administrator"}:
+            set_telegram_approval_chat_candidate(str(chat.get("id") or ""))
+        return
     callback = update.get("callback_query")
     if not isinstance(callback, dict):
         return
@@ -170,7 +178,7 @@ def poll_once() -> None:
         {
             "offset": str(offset),
             "timeout": str(POLL_TIMEOUT_SECONDS),
-            "allowed_updates": json.dumps(["callback_query"]),
+            "allowed_updates": json.dumps(["callback_query", "my_chat_member"]),
         },
         timeout=POLL_TIMEOUT_SECONDS + 10,
     )

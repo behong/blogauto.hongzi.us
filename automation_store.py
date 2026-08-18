@@ -24,6 +24,7 @@ AUTOMATION_API_TOKEN = os.getenv("AUTOMATION_API_TOKEN", "").strip()
 TOSS_OPEN_API_PUBLISHER_ID = os.getenv("TOSS_OPEN_API_PUBLISHER_ID", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_APPROVAL_CHAT_ID = os.getenv("TELEGRAM_APPROVAL_CHAT_ID", "").strip()
 DB_MAX_RETRIES = max(1, int(os.getenv("DB_MAX_RETRIES", "3")))
 AUTOMATION_AUDIT_CSV_PATH = os.getenv(
     "AUTOMATION_AUDIT_CSV_PATH", "data/automation_history.csv"
@@ -315,13 +316,69 @@ def set_admin_toss_publisher_id(publisher_id: str) -> None:
 APPROVAL_ACTIONS = {"APPROVED", "HELD"}
 
 
+def active_telegram_approval_chat_id() -> str:
+    if TELEGRAM_APPROVAL_CHAT_ID:
+        return TELEGRAM_APPROVAL_CHAT_ID
+    if not DATABASE_URL:
+        return TELEGRAM_CHAT_ID
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT state_value FROM telegram_bot_state WHERE state_key = 'approval_chat_id'"
+        ).fetchone()
+    selected = str((row or {}).get("state_value") or "").strip()
+    return selected or TELEGRAM_CHAT_ID
+
+
+def set_telegram_approval_chat_id(chat_id: str) -> None:
+    normalized_chat_id = str(chat_id or "").strip()
+    if not normalized_chat_id:
+        raise ValueError("invalid Telegram approval chat ID")
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_bot_state (state_key, state_value)
+            VALUES ('approval_chat_id', %s)
+            ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = now()
+            """,
+            (normalized_chat_id[:100],),
+        )
+
+
+def set_telegram_approval_chat_candidate(chat_id: str) -> None:
+    normalized_chat_id = str(chat_id or "").strip()
+    if not normalized_chat_id:
+        return
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_bot_state (state_key, state_value)
+            VALUES ('approval_chat_candidate_id', %s)
+            ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = now()
+            """,
+            (normalized_chat_id[:100],),
+        )
+
+
+def activate_telegram_approval_chat_candidate() -> bool:
+    with _connect() as conn:
+        candidate = conn.execute(
+            "SELECT state_value FROM telegram_bot_state WHERE state_key = 'approval_chat_candidate_id'"
+        ).fetchone()
+    value = str((candidate or {}).get("state_value") or "").strip()
+    if not value:
+        return False
+    set_telegram_approval_chat_id(value)
+    return True
+
+
 def create_publication_approval_batch(
     summary: list[dict[str, Any]],
     expires_at: datetime,
     source: str = "toss-daily",
 ) -> dict[str, Any]:
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_CHAT_ID is not configured")
+    approval_chat_id = active_telegram_approval_chat_id()
+    if not approval_chat_id:
+        raise RuntimeError("TELEGRAM approval chat is not configured")
     if not summary:
         raise ValueError("approval batch requires at least one item")
     if len(summary) > 10:
@@ -342,7 +399,7 @@ def create_publication_approval_batch(
                 str(source or "toss-daily")[:100],
                 len(summary),
                 json.dumps(summary, ensure_ascii=False),
-                TELEGRAM_CHAT_ID,
+                approval_chat_id,
                 expires_at,
             ),
         ).fetchone()

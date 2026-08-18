@@ -67,6 +67,19 @@ class TelegramApprovalTests(unittest.TestCase):
         answer.assert_called_once_with("callback-1", "3건 발행 배치를 승인했습니다.")
         disable.assert_called_once_with("88", 91)
 
+    @patch("telegram_approval.set_telegram_approval_chat_candidate")
+    def test_records_new_bot_membership_as_approval_channel_candidate(self, set_candidate):
+        telegram_approval.handle_update(
+            {
+                "my_chat_member": {
+                    "chat": {"id": -1001234567890},
+                    "new_chat_member": {"status": "administrator"},
+                }
+            }
+        )
+
+        set_candidate.assert_called_once_with("-1001234567890")
+
     @patch("telegram_approval._answer_callback")
     @patch(
         "telegram_approval.resolve_publication_approval",
