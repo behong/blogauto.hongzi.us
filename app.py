@@ -34,6 +34,7 @@ from admin_auth import (
 from automation_store import (
     admin_password_hash,
     admin_toss_publisher_id,
+    admin_toss_publisher_settings,
     authorized as automation_authorized,
     check_duplicate,
     configured as automation_configured,
@@ -528,8 +529,15 @@ class AppHandler(BaseHTTPRequestHandler):
                     )
                     return
                 if parsed.path == "/api/admin/settings":
+                    publisher = admin_toss_publisher_settings()
                     self._send_admin_json(
-                        {"ok": True, "result": {"publisher_configured": bool(admin_toss_publisher_id())}}
+                        {
+                            "ok": True,
+                            "result": {
+                                "publisher_configured": bool(publisher["configured"]),
+                                "publisher_source": publisher["source"],
+                            },
+                        }
                     )
                     return
                 if parsed.path == "/api/admin/toss/products":
@@ -658,7 +666,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     import uuid
                     uuid.UUID(publisher_id)
                     set_admin_toss_publisher_id(publisher_id)
-                    self._send_admin_json({"ok": True, "result": {"publisher_configured": True}})
+                    publisher = admin_toss_publisher_settings()
+                    self._send_admin_json(
+                        {
+                            "ok": True,
+                            "result": {
+                                "publisher_configured": bool(publisher["configured"]),
+                                "publisher_source": publisher["source"],
+                            },
+                        }
+                    )
                     return
                 if parsed.path == "/api/admin/toss/links":
                     result = issue_toss_share_link(str(payload.get("taca_item_id") or ""))

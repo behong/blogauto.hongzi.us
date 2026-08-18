@@ -182,12 +182,15 @@
 
   const loadSettings = async () => {
     const settings = await api("/api/admin/settings");
-    if (settings.publisher_configured) {
-      publisherId.placeholder = "퍼블리셔 UUID가 저장되어 있습니다. 변경하려면 새 UUID를 입력하세요.";
-      setStatus(publisherStatus, "퍼블리셔 UUID가 설정됐습니다. 선택 상품의 쉐어링크를 발급할 수 있습니다.", "success");
+    if (settings.publisher_source === "environment") {
+      publisherId.placeholder = "환경 변수로 설정되어 있습니다. 필요할 때만 DB 보조값을 입력하세요.";
+      setStatus(publisherStatus, "환경 변수 TOSS_OPEN_API_PUBLISHER_ID가 적용 중입니다. 선택한 상품의 쉐어링크를 발급할 수 있습니다.", "success");
+    } else if (settings.publisher_source === "database") {
+      publisherId.placeholder = "관리자 화면에 저장된 UUID가 사용 중입니다. 환경 변수 설정 시 그 값이 우선 적용됩니다.";
+      setStatus(publisherStatus, "관리자 화면 저장값이 사용 중입니다. 배포 설정으로 옮기려면 TOSS_OPEN_API_PUBLISHER_ID를 환경 변수에 추가하세요.", "success");
     } else {
       publisherId.placeholder = "토스에서 안내받은 퍼블리셔 UUID 입력";
-      setStatus(publisherStatus, "퍼블리셔 UUID를 설정하면 선택한 상품의 쉐어링크를 발급할 수 있습니다.");
+      setStatus(publisherStatus, "권장: TOSS_OPEN_API_PUBLISHER_ID 환경 변수에 UUID를 설정하세요. 필요하면 이 화면의 저장값을 보조로 사용할 수 있습니다.");
     }
   };
 
@@ -258,7 +261,7 @@
     event.preventDefault();
     const value = publisherId.value.trim();
     if (!value) {
-      setStatus(publisherStatus, "토스에서 안내받은 퍼블리셔 UUID를 입력해 주세요.", "error");
+      setStatus(publisherStatus, "환경 변수를 쓰는 경우 이 입력칸을 비워 두어도 됩니다. DB 보조값을 저장하려면 UUID를 입력해 주세요.", "error");
       return;
     }
     setBusy(true);

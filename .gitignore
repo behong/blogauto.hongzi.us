@@ -5,6 +5,7 @@ __pycache__/
 
 # Local credentials, browser sessions, runtime state, and generated diagnostics
 .env.*
+!.env.example
 data/browser-profile/
 _backup_*/
 .pytest_cache/

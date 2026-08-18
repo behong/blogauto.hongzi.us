@@ -19,6 +19,9 @@ from psycopg.rows import dict_row
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 AUTOMATION_API_TOKEN = os.getenv("AUTOMATION_API_TOKEN", "").strip()
+# This is a deployment setting, not an administrator credential.  When present,
+# it is the authoritative source for Open API share-link issuance.
+TOSS_OPEN_API_PUBLISHER_ID = os.getenv("TOSS_OPEN_API_PUBLISHER_ID", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_MAX_RETRIES = max(1, int(os.getenv("DB_MAX_RETRIES", "3")))
@@ -229,12 +232,33 @@ def admin_password_hash() -> str:
     return str((row or {}).get("password_hash") or "")
 
 
-def admin_toss_publisher_id() -> str:
+def _admin_toss_publisher_id_from_database() -> str:
     with _connect() as conn:
         row = conn.execute(
             "SELECT toss_publisher_id FROM admin_settings WHERE singleton = true"
         ).fetchone()
     return str((row or {}).get("toss_publisher_id") or "")
+
+
+def admin_toss_publisher_settings() -> dict[str, str | bool]:
+    """Return the effective publisher setting without exposing its UUID.
+
+    A deployment environment value always wins.  The existing administrator
+    setting remains a migration-friendly fallback for installations that have
+    not yet moved the value to their environment configuration.
+    """
+    if TOSS_OPEN_API_PUBLISHER_ID:
+        return {"configured": True, "source": "environment"}
+    database_value = _admin_toss_publisher_id_from_database()
+    if database_value:
+        return {"configured": True, "source": "database"}
+    return {"configured": False, "source": "unset"}
+
+
+def admin_toss_publisher_id() -> str:
+    if TOSS_OPEN_API_PUBLISHER_ID:
+        return TOSS_OPEN_API_PUBLISHER_ID
+    return _admin_toss_publisher_id_from_database()
 
 
 def set_admin_toss_publisher_id(publisher_id: str) -> None:
